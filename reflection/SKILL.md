@@ -13,85 +13,109 @@ description: >
 
 # Reflection Skill
 
-The goal is to turn ephemeral session knowledge into durable improvements. You've just helped
-the user through a session — patterns were confirmed, mistakes were corrected, preferences
-were revealed. Capture what's worth keeping before the context disappears.
+The goal is to turn ephemeral session knowledge into durable improvements. Patterns were
+confirmed, mistakes were corrected, preferences were revealed — capture what's worth keeping
+before the context disappears.
 
-## Phase 1 — Load files (single parallel batch)
+## Phase 0 — Zero-cost analysis (no tool calls)
 
-**Config files:**
-- `~/.claude/CLAUDE.md` — global user-level config (applies to ALL projects)
-- Project CLAUDE.md files: `Glob pattern="**/CLAUDE.md"` from the project root, then read each result
-- `.claude/settings.json` and `.claude/settings.local.json`
-- Command files: `Glob pattern=".claude/commands/*.md"`, then for each file:
-  - If ≤40 lines: read in full
-  - If >40 lines: `Grep pattern="workflow|command|run|invoke"` to check for stale references only
+Everything here runs on data already in context. Do this first, before any tool calls.
 
-**Memory files:**
-- `~/.claude/projects/<project-slug>/memory/MEMORY.md`
-- Topic files linked from MEMORY.md: read each with `limit=80` — enough to assess content without loading everything
-- `Glob` the full memory directory to detect files not linked from MEMORY.md (orphan candidates)
+**Session analysis** (from conversation history):
+- Did Claude misunderstand a request that a rule could prevent next time?
+- Were there repeated corrections or clarifications?
+- Did Claude **violate an existing rule**? → needs strengthening
+- Did the user type the same prompt more than once? → candidate for a new slash command
+- Did a tool or permission get approved that should be persisted in settings?
+- Was a pattern confirmed, a memory entry contradicted, or a problem solved in a reusable way?
 
-**Skills:**
-- `Glob pattern="~/.claude/skills/*"` to list installed skills
-- Descriptions are already in the `system-reminder` skills list — no file reads needed
+**MEMORY.md analysis** (content already in context via auto-memory):
+- **Duplication** — same fact in two bullets or sections
+- **Vagueness** — rule with no clear trigger or action ("be careful with X")
+- **Bloat** — block >5 lines or 3+ bullets sharing a theme; flag if MEMORY.md >160 lines
+- **Skills staleness** — skill names referenced in MEMORY.md that don't appear in the `system-reminder` list
+- **Oversize document** — scan session history for Read calls on files ≥150 lines without `offset`/`limit`
+- **Skill description quality** — for each skill invoked this session, is its `system-reminder` description specific enough to trigger reliably?
 
-## Phase 1 — Analysis passes (run in this order)
+Hold all findings, then proceed to Phase 1.
+
+## Phase 1 — Fetch files
+
+**Step 1 — Run the gather script (1 tool call):**
+```
+python ~/.claude/skills/reflection/scripts/gather.py
+```
+
+Returns a JSON manifest: every relevant path, whether it exists, and its line count:
+- `global_claude_md` — `~/.claude/CLAUDE.md`
+- `project_claude_mds` — all `**/CLAUDE.md` under CWD
+- `settings` — `.claude/settings.json` and `.claude/settings.local.json`
+- `commands` — `.claude/commands/*.md`
+- `memory_files` — all files in the memory directory
+- `slug` and `memory_dir` — pre-computed
+
+**Step 2 — Read files in one parallel batch:**
+Use `lines` from the manifest to set limits — never load more than needed:
+- `global_claude_md` and `project_claude_mds`: `lines ≤ 150` → read in full; `> 150` → `limit=150`
+- `settings` files: read in full
+- Command files: `lines ≤ 40` → read in full; `> 40` → Grep for stale references only
+- Memory files linked in the in-context MEMORY.md: read with `limit=80`
+- Memory files **not** linked in MEMORY.md: note as orphan candidates, no read yet
+
+Two tool calls total for Phase 1: gather script + one parallel read batch.
+
+## Phase 2 — Analysis on fetched files
 
 ### Pass 1 — Staleness & cross-reference
 
-Merge of cross-reference and freshness detection — both look for references that no longer hold:
+- Does MEMORY.md reference skills, files, or tools absent from the gather output? → stale reference
+- Are there `memory_files` not linked from MEMORY.md? → orphan candidate. `Read limit=50` to summarize before proposing deletion.
+- Do CLAUDE.md entries reference completed work, resolved bugs, or outdated versions? → freshness candidate
 
-- Does MEMORY.md reference skills, files, or tools that don't exist? (Check against the skills glob and memory dir glob.) → stale reference
-- Are there memory directory files not linked from MEMORY.md? → orphan candidate. Before proposing deletion, `Read limit=50` to summarize content for the user.
-- Do MEMORY.md or CLAUDE.md entries reference completed epics/stories by name, resolved bugs, specific package versions that changed, or workarounds for problems that no longer exist? → freshness candidate for archiving or deletion
+### Pass 2 — Document sharpening
 
-### Pass 2 — Document sharpening scan
+Apply to all newly loaded files (CLAUDE.md, command files, topic files):
 
-Detects gradual degradation across all documents read in Phase 1.
+**Duplication** — same rule in CLAUDE.md and MEMORY.md, or repeated within a single file.
 
-**Duplication** — same rule or fact in two places (CLAUDE.md + MEMORY.md, or two bullets in the same section). Propose merging into the canonical location.
+**Vagueness** — rule with no clear trigger or no specific action.
 
-**Vagueness** — rule with no clear trigger or no specific action ("be careful with X", "consider Y"). A sharp rule names *when* it applies and *exactly* what to do. Propose a rewrite or deletion.
+**Contradiction** — two rules prescribing opposite behaviors. Propose a single source of truth.
 
-**Bloat** — MEMORY.md block >5 lines, or 3+ bullets sharing a theme. Propose moving to a topic file + one-line summary + link. Also flag if MEMORY.md >160 lines (truncation limit is 200).
+**Global vs project scope** — rules in `~/.claude/CLAUDE.md` that are project-specific, or vice versa.
 
-**Contradiction** — two rules prescribing opposite behaviors, especially between CLAUDE.md and MEMORY.md. Propose a single source of truth.
+**Oversize document** — extend the Phase 0 scan with large files now loaded. Propose: split via `bmad-shard-doc` (check `system-reminder` if installed), prepend a compact index block (10–20 lines, topic → line range), or delete stale sections.
 
-**Oversize document** — scan session history for Read calls on files ≥150 lines loaded in full (no `offset`/`limit`), or multiple sequential paginated passes on the same file. For each: note path, line count, fraction of content actually used. Propose one of: split via `bmad-shard-doc` (reuse Phase 1 skills listing to check if installed), prepend a compact index block (10–20 lines mapping topic → line range), or delete stale sections. Highest-value signal — costs tokens every session.
+### Pass 3 — Net-new additions
 
-**Global vs project scope** — rules in `~/.claude/CLAUDE.md` that are project-specific, or rules in the project CLAUDE.md that should apply globally. Misplacement means they don't fire in the right context.
+Separate from finding problems — ask: *what from this session is worth adding fresh?*
 
-**Skill description quality** — for each skill invoked or referenced in this session, check its description from the `system-reminder` (already in context). Is it specific enough to trigger reliably?
+- Was a technique, workaround, or debugging approach used that worked well and isn't in memory yet?
+- Was a tool combination, workflow, or sequence discovered that would help future sessions?
+- Was a user preference expressed (style, tone, tooling, decision) that wasn't already captured?
+- Was a project-specific fact learned (architecture, key file, naming convention) that belongs in memory?
 
-### Pass 3 — Session analysis
+For each candidate, draft the **exact text** to add — not a vague description of it. If nothing new was learned, say so explicitly rather than skipping silently.
 
-**For CLAUDE.md / config:**
-- Did Claude misunderstand a request that a rule could prevent next time?
-- Were there repeated corrections or clarifications?
-- Did Claude **violate an existing rule**? The rule needs strengthening: sharper trigger, harder verb ("never" vs "avoid"), or more prominent placement.
-- Did the user type the same prompt **more than once**? → direct signal for a new slash command.
-- Did a tool, permission, or MCP get approved that should be persisted in settings?
+These become **Addition** findings (lowest priority, but never omitted).
 
-**For memory files:**
-- Was a pattern confirmed across multiple moments in this session (→ worth saving)?
-- Was an existing memory entry contradicted or shown to be wrong (→ update/remove)?
-- Was a problem solved in a way that would help future sessions (→ debugging.md, patterns.md)?
-- Was a preference expressed that should survive across conversations?
+---
 
-**What NOT to save:**
+**What NOT to save** (applies across all passes):
 - Session-specific context (current task, temp state, in-progress work)
 - Speculative conclusions from a single observation
 - Anything already covered in existing CLAUDE.md rules or memory entries
 
-## Phase 2 — Interactive Review
+## Phase 3 — Interactive Review
+
+**Gap check first:** If `memory_dir_exists: false` or `memory_files: []` in the gather output, always propose creating MEMORY.md with key session facts — even if no other issues found.
 
 If no findings: say so briefly and stop.
 
 Otherwise, present all findings at once **sorted by priority** before implementing anything:
 
 1. **Contradiction** — two rules prescribe opposite behaviors
-2. **Oversize** — full read forced on large file (burns tokens every session)
+2. **Oversize** — large file read in full (burns tokens every session)
 3. **Rule violated** — existing rule broken in this session (needs strengthening)
 4. **Duplication** — same rule in two places
 5. **Staleness** — stale references, completed work, old versions
@@ -99,22 +123,25 @@ Otherwise, present all findings at once **sorted by priority** before implementi
 7. **Bloat** — section too long for active memory
 8. **Vagueness** — rule not actionable
 9. **Orphan / stale command / skill description** — cleanup, low urgency
+10. **Addition** — net-new memory entry or rule worth adding
+11. **Gap** — missing MEMORY.md
 
 Each finding uses this format:
 
 ```
-### [Category — subcategory if applicable]
+### [Category]
 
 **Observed**: [What was found — quote or describe, with file + location]
-**Problem**: [One line: why this is an issue]
-**Before**: [Current text, verbatim or summarized — omit if it's a new addition]
-**After**: [Exact replacement text — or DELETE]
+**Problem**: [One line: why this is an issue — omit for Addition findings]
+**Before**: [Current text, verbatim — omit for new additions]
+**After**: [Exact replacement text, or DELETE, or new text to add]
+**Action**: [APPLIED / SKIPPED — filled in after user decision]
 **File**: [exact path(s)]
 ```
 
 Wait for the user to approve individually, say "all", or ask to modify.
 
-## Phase 3 — Implementation
+## Phase 4 — Implementation
 
 For each approved change:
 
@@ -131,8 +158,48 @@ For each approved change:
 4. **Settings**: Add tool permissions or MCP entries to `settings.local.json` (not `settings.json`).
 
 5. **Oversize document**:
-   - If `bmad-shard-doc` is installed (reuse Phase 1 skills listing — no re-read): tell the user they can run `/bmad-shard-doc` on the file to split by H2.
-   - If the file is a flat list (not H2-sectioned): draft a compact index block (10–20 lines, topic → line range) and propose prepending it so future sessions can Grep the index.
-   - If the issue is stale sections: delete them directly.
+   - `bmad-shard-doc` in `system-reminder` → tell the user they can run `/bmad-shard-doc` on the file
+   - Flat list (no H2 sections) → prepend a compact index block so future sessions can Grep it
+   - Stale sections only → delete them directly
 
 After all changes, confirm what was modified in one short list.
+
+## Phase 5 — Write log entry
+
+Compose a JSON object and run:
+```
+python ~/.claude/skills/reflection/scripts/write_log.py - <memory_dir>/reflection-log.md
+```
+Use `memory_dir` from the gather output. Pass JSON via stdin (`-`). Script creates the file if absent and always appends.
+
+```json
+{
+  "date": "YYYY-MM-DD",
+  "project": "<CWD basename>",
+  "session": "<one sentence: what this session was about>",
+  "tool_calls": {
+    "phase_1_step_1": ["python gather.py"],
+    "phase_1_step_2": ["Read ~/.claude/CLAUDE.md", "Read .claude/settings.json", "..."],
+    "phase_4": ["Edit memory/MEMORY.md", "..."]
+  },
+  "findings": [
+    {
+      "id": 1,
+      "category": "Bloat",
+      "file": "exact/path",
+      "observed": "verbatim quote or precise description",
+      "problem": "why this is an issue",
+      "action": "APPLIED",
+      "reason": "",
+      "before": "exact original text, or n/a for new additions",
+      "after": "exact replacement text, DELETE, or n/a if skipped"
+    }
+  ]
+}
+```
+
+Rules:
+- Use today's date from `currentDate` context if available.
+- Every finding gets an entry — nothing omitted, even if skipped.
+- `before`/`after` must be verbatim for applied changes — this is the audit trail.
+- List every tool call made during this run, grouped by phase.
