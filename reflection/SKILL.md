@@ -41,9 +41,18 @@ Hold all findings, then proceed to Phase 1.
 
 ## Phase 1 — Fetch files
 
-**Step 1 — Run the gather script (1 tool call):**
+**Step 1 — Locate and run the gather script (2 tool calls):**
+
+First, use Glob to find the script (install path varies):
 ```
-python ~/.claude/skills/reflection/scripts/gather.py
+pattern: **/reflection/scripts/gather.py
+path: ~/.claude/
+```
+Store the directory containing it as `SCRIPTS_DIR`. If not found, abort with: "reflection scripts not found — check skill installation."
+
+Then run it:
+```
+python <SCRIPTS_DIR>/gather.py
 ```
 
 Returns a JSON manifest: every relevant path, whether it exists, and its line count:
@@ -168,8 +177,9 @@ After all changes, confirm what was modified in one short list.
 
 Compose a JSON object and run:
 ```
-python ~/.claude/skills/reflection/scripts/write_log.py - <memory_dir>/reflection-log.md
+python <SCRIPTS_DIR>/write_log.py - <memory_dir>/reflection-log.md
 ```
+(`SCRIPTS_DIR` is the directory found in Phase 1.)
 Use `memory_dir` from the gather output. Pass JSON via stdin (`-`). Script creates the file if absent and always appends.
 
 ```json
